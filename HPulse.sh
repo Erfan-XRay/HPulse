@@ -18,7 +18,7 @@ SCRIPT_DIR="$(dirname "$TRUST_SCRIPT_PATH")"
 SETUP_MARKER_FILE="/var/lib/frpulse/.setup_complete" # Changed TrustTunnel to FRPulse
 
 # --- Script Version ---
-SCRIPT_VERSION="1.7.0" # Define the script version - UPDATED TO 1.7.0
+SCRIPT_VERSION="1.8.0" # Define the script version - UPDATED TO 1.8.0
 
 # --- Helper Functions ---
 
@@ -694,18 +694,35 @@ add_new_hysteria_server_action() {
   echo ""
 
   local certs_dir="/etc/letsencrypt/live"
-  if [ ! -d "$certs_dir" ]; then
-    print_error "❌ No certificates directory found at $certs_dir."
-    print_error "   Please ensure Certbot is installed and certificates are obtained."
-    echo -e "${YELLOW}Press Enter to return to main menu...${RESET}"
-    read -p ""
-    return
+  local self_signed_dir="$(pwd)/hysteria/certs/selfsigned"
+  local available_certs=()
+  local cert_paths=()
+  local key_paths=()
+
+  # Check LetsEncrypt Certs
+  if [ -d "$certs_dir" ]; then
+    while IFS= read -r domain; do
+        if [[ -n "$domain" ]]; then
+            available_certs+=("$domain (LetsEncrypt)")
+            cert_paths+=("$certs_dir/$domain/fullchain.pem")
+            key_paths+=("$certs_dir/$domain/privkey.pem")
+        fi
+    done < <(sudo find "$certs_dir" -maxdepth 1 -mindepth 1 -type d ! -name "README" -exec basename {} \;)
   fi
 
-  mapfile -t cert_domains < <(sudo find "$certs_dir" -maxdepth 1 -mindepth 1 -type d ! -name "README" -exec basename {} \;)
+  # Check Self-Signed Certs
+  if [ -d "$self_signed_dir" ]; then
+    while IFS= read -r name; do
+        if [[ -n "$name" ]]; then
+            available_certs+=("$name (Self-Signed)")
+            cert_paths+=("$self_signed_dir/$name/fullchain.pem")
+            key_paths+=("$self_signed_dir/$name/privkey.pem")
+        fi
+    done < <(find "$self_signed_dir" -maxdepth 1 -mindepth 1 -type d -exec basename {} \;)
+  fi
 
-  if [ ${#cert_domains[@]} -eq 0 ]; then
-    print_error "❌ No SSL certificates found in $certs_dir."
+  if [ ${#available_certs[@]} -eq 0 ]; then
+    print_error "❌ No SSL certificates found (LetsEncrypt or Self-Signed)."
     print_error "   Please create one from the 'Certificate management' menu first."
     echo -e "${YELLOW}Press Enter to return to main menu...${RESET}"
     read -p ""
@@ -713,23 +730,25 @@ add_new_hysteria_server_action() {
   fi
 
   echo -e "${CYAN}Available SSL Certificates:${RESET}"
-  for i in "${!cert_domains[@]}"; do
-    echo -e "  ${YELLOW}$((i+1)))${RESET} ${WHITE}${cert_domains[$i]}${RESET}"
+  for i in "${!available_certs[@]}"; do
+    echo -e "  ${YELLOW}$((i+1)))${RESET} ${WHITE}${available_certs[$i]}${RESET}"
   done
 
   local cert_choice
   while true; do
     echo -e "👉 ${WHITE}Select a certificate by number to use for Hysteria server:${RESET} "
     read -p "" cert_choice
-    if [[ "$cert_choice" =~ ^[0-9]+$ ]] && [ "$cert_choice" -ge 1 ] && [ "$cert_choice" -le ${#cert_domains[@]} ]; then
+    if [[ "$cert_choice" =~ ^[0-9]+$ ]] && [ "$cert_choice" -ge 1 ] && [ "$cert_choice" -le ${#available_certs[@]} ]; then
       break
     else
       print_error "Invalid selection. Please enter a valid number."
     fi
   done
-  local selected_domain_name="${cert_domains[$((cert_choice-1))]}"
-  tls_cert_file="$certs_dir/$selected_domain_name/fullchain.pem"
-  tls_key_file="$certs_dir/$selected_domain_name/privkey.pem"
+  
+  local selected_index=$((cert_choice-1))
+  tls_cert_file="${cert_paths[$selected_index]}"
+  tls_key_file="${key_paths[$selected_index]}"
+  local selected_cert_name="${available_certs[$selected_index]}"
 
   if [ ! -f "$tls_cert_file" ] || [ ! -f "$tls_key_file" ]; then
     print_error "❌ Selected SSL certificate files not found: $tls_cert_file or $tls_key_file."
@@ -739,7 +758,7 @@ add_new_hysteria_server_action() {
     read -p ""
     return
   fi
-  print_success "Selected certificate for TLS: $selected_domain_name"
+  print_success "Selected certificate: $selected_cert_name"
 
   case "$server_mode_choice" in
     1) # Strict Mode
@@ -2039,6 +2058,136 @@ delete_certificates_action() {
   read -p ""
 }
 
+# Function to generate a self-signed certificate
+generate_self_signed_cert_action() {
+  clear
+  echo ""
+  draw_line "$CYAN" "=" 40
+  echo -e "${CYAN}     📝 Generate Self-Signed Certificate${RESET}"
+  draw_line "$CYAN" "=" 40
+  echo ""
+  
+  echo -e "${YELLOW}⚠️  WARNING: Self-signed certificates only work with SNI Mode!${RESET}"
+  echo -e "${YELLOW}    Do not use this for Strict Mode.${RESET}"
+  echo ""
+
+  local cert_name
+  while true; do
+    echo -e "👉 ${WHITE}Enter a name for this certificate (e.g., my-self-signed):${RESET} "
+    read -p "" cert_name
+    # Sanitize input
+    cert_name=$(echo "$cert_name" | tr -cd '[:alnum:]_-')
+    if [[ -n "$cert_name" ]]; then
+      break
+    else
+      print_error "Certificate name cannot be empty."
+    fi
+  done
+  echo ""
+
+  local cert_dir="$(pwd)/hysteria/certs/selfsigned/$cert_name"
+  if [ -d "$cert_dir" ]; then
+    print_error "A certificate with this name already exists."
+    echo -e "${YELLOW}Press Enter to return to previous menu...${RESET}"
+    read -p ""
+    return
+  fi
+
+  mkdir -p "$cert_dir"
+
+  echo -e "${CYAN}Generating self-signed certificate...${RESET}"
+  
+  # Generate key and cert
+  # using the name as CN
+  if openssl req -x509 -newkey rsa:2048 -keyout "$cert_dir/privkey.pem" -out "$cert_dir/fullchain.pem" -sha256 -days 3650 -nodes -subj "/CN=$cert_name" 2>/dev/null; then
+    print_success "Self-signed certificate generated successfully."
+    echo -e "   Path: ${WHITE}$cert_dir${RESET}"
+  else
+    print_error "Failed to generate certificate. Please check if openssl is installed."
+    rm -rf "$cert_dir" # Cleanup
+  fi
+
+  echo ""
+  echo -e "${YELLOW}Press Enter to return to previous menu...${RESET}"
+  read -p ""
+}
+
+# Function to delete self-signed certificates
+delete_self_signed_cert_action() {
+  clear
+  echo ""
+  draw_line "$RED" "=" 40
+  echo -e "${RED}     🗑️ Delete Self-Signed Certificate${RESET}"
+  draw_line "$RED" "=" 40
+  echo ""
+
+  local cert_base_dir="$(pwd)/hysteria/certs/selfsigned"
+  
+  if [ ! -d "$cert_base_dir" ]; then
+     print_error "No self-signed certificates found."
+     echo -e "${YELLOW}Press Enter to return to previous menu...${RESET}"
+     read -p ""
+     return
+  fi
+
+  mapfile -t cert_names < <(find "$cert_base_dir" -maxdepth 1 -mindepth 1 -type d -exec basename {} \;)
+
+  if [ ${#cert_names[@]} -eq 0 ]; then
+    print_error "No self-signed certificates found."
+    echo -e "${YELLOW}Press Enter to return to previous menu...${RESET}"
+    read -p ""
+    return
+  fi
+
+  echo -e "${CYAN}📋 Please select a certificate to delete:${RESET}"
+  cert_names+=("Back to previous menu")
+  select selected_cert in "${cert_names[@]}"; do
+    if [[ "$selected_cert" == "Back to previous menu" ]]; then
+      return
+    elif [ -n "$selected_cert" ]; then
+      break
+    else
+      print_error "Invalid selection."
+    fi
+  done
+
+  echo -e "${RED}⚠️ Are you sure you want to delete '$selected_cert'? (y/N): ${RESET}"
+  read -p "" confirm
+  if [[ "$confirm" =~ ^[Yy]$ ]]; then
+      rm -rf "$cert_base_dir/$selected_cert"
+      print_success "Certificate deleted."
+  else
+      echo -e "${YELLOW}Cancelled.${RESET}"
+  fi
+  
+  echo ""
+  echo -e "${YELLOW}Press Enter to return to previous menu...${RESET}"
+  read -p ""
+}
+
+# Self-signed certificate menu
+self_signed_certificate_menu() {
+  while true; do
+    clear
+    echo ""
+    draw_line "$CYAN" "=" 40
+    echo -e "${CYAN}     📝 Self-Signed Certificates${RESET}"
+    draw_line "$CYAN" "=" 40
+    echo ""
+    echo -e "  ${YELLOW}1)${RESET} ${WHITE}Generate new certificate${RESET}"
+    echo -e "  ${YELLOW}2)${RESET} ${WHITE}Delete certificate${RESET}"
+    echo -e "  ${YELLOW}3)${RESET} ${WHITE}Back to previous menu${RESET}"
+    echo ""
+    read -p "👉 Your choice: " choice
+    case $choice in
+      1) generate_self_signed_cert_action ;;
+      2) delete_self_signed_cert_action ;;
+      3) break ;;
+      *) print_error "Invalid option." ;;
+    esac
+  done
+}
+
 # --- New: Certificate Management Menu Function ---
 certificate_management_menu() {
   while true; do
@@ -2050,7 +2199,8 @@ certificate_management_menu() {
     echo ""
     echo -e "  ${YELLOW}1)${RESET} ${WHITE}Get new certificate${RESET}"
     echo -e "  ${YELLOW}2)${RESET} ${WHITE}Delete certificates${RESET}"
-    echo -e "  ${YELLOW}3)${RESET} ${WHITE}Back to main menu${RESET}"
+    echo -e "  ${YELLOW}3)${RESET} ${WHITE}Self signed certificate${RESET}"
+    echo -e "  ${YELLOW}4)${RESET} ${WHITE}Back to main menu${RESET}"
     echo ""
     draw_line "$YELLOW" "-" 40
     echo -e "👉 ${CYAN}Your choice:${RESET} "
@@ -2065,6 +2215,9 @@ certificate_management_menu() {
         delete_certificates_action
         ;;
       3)
+        self_signed_certificate_menu
+        ;;
+      4)
         echo -e "${YELLOW}Returning to main menu...${RESET}"
         break # Break out of this while loop to return to main menu
         ;;
